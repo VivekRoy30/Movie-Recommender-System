@@ -3,6 +3,7 @@ from html import escape
 import os
 from pathlib import Path
 import pickle
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -15,6 +16,11 @@ SIMILARITY_FILE = BASE_DIR / "similarity.pkl"
 TMDB_API_KEY = "8265bd1679663a7ea12ac168da84d2e8"
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", TMDB_API_KEY)
 POSTER_BASE_URL = "https://image.tmdb.org/t/p/w500"
+TPDB_API_KEY = os.getenv("TPDB_API_KEY")
+TPDB_POSTER_URL_TEMPLATE = os.getenv("TPDB_POSTER_URL_TEMPLATE")
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+WIKIPEDIA_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary"
+POSTER_REQUEST_HEADERS = {"User-Agent": "movie-recommender-system/1.0"}
 
 
 st.set_page_config(page_title="Movie Recommender", layout="wide")
@@ -69,7 +75,12 @@ def fetch_poster_by_id(movie_id):
     params = {"api_key": TMDB_API_KEY, "language": "en-US"}
 
     try:
-        response = requests.get(url, params=params, timeout=3)
+        response = requests.get(
+            url,
+            params=params,
+            headers=POSTER_REQUEST_HEADERS,
+            timeout=3,
+        )
         response.raise_for_status()
         poster_path = response.json().get("poster_path")
     except (requests.RequestException, ValueError):
@@ -85,7 +96,12 @@ def fetch_poster_by_title(movie_title):
     params = {"api_key": TMDB_API_KEY, "query": movie_title, "language": "en-US"}
 
     try:
-        response = requests.get(url, params=params, timeout=3)
+        response = requests.get(
+            url,
+            params=params,
+            headers=POSTER_REQUEST_HEADERS,
+            timeout=3,
+        )
         response.raise_for_status()
         results = response.json().get("results", [])
     except (requests.RequestException, ValueError):
@@ -98,9 +114,134 @@ def fetch_poster_by_title(movie_title):
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_poster_from_tpdb(movie_id, movie_title):
+    """Return a poster URL from a configured TPDb-compatible endpoint.
+
+    TPDb deployments/API wrappers vary, so the app accepts a URL template instead
+    of assuming one endpoint shape. The template can use {movie_id}, {title}, and
+    {api_key} placeholders.
+    """
+    if not TPDB_POSTER_URL_TEMPLATE:
+        return None
+
+    url = TPDB_POSTER_URL_TEMPLATE.format(
+        api_key=TPDB_API_KEY or "",
+        movie_id=movie_id,
+        title=quote(str(movie_title)),
+    )
+
+    try:
+        response = requests.get(url, headers=POSTER_REQUEST_HEADERS, timeout=4)
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        return response.url
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+
+    if isinstance(payload, dict):
+        for key in ("poster", "poster_url", "url", "image", "image_url"):
+            poster_url = payload.get(key)
+            if poster_url:
+                return poster_url
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("poster", "poster_url", "url", "image", "image_url"):
+                poster_url = data.get(key)
+                if poster_url:
+                    return poster_url
+
+        results = payload.get("results")
+        if isinstance(results, list) and results:
+            first_result = results[0]
+            if isinstance(first_result, dict):
+                for key in ("poster", "poster_url", "url", "image", "image_url"):
+                    poster_url = first_result.get(key)
+                    if poster_url:
+                        return poster_url
+
+    return None
+
+
+def get_wikipedia_search_titles(movie_title):
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": f"{movie_title} film",
+        "format": "json",
+        "srlimit": 3,
+    }
+
+    try:
+        response = requests.get(
+            WIKIPEDIA_API_URL,
+            params=params,
+            headers=POSTER_REQUEST_HEADERS,
+            timeout=4,
+        )
+        response.raise_for_status()
+        results = response.json().get("query", {}).get("search", [])
+    except (requests.RequestException, ValueError):
+        return []
+
+    return [result["title"] for result in results if result.get("title")]
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_poster_from_wikipedia(movie_title):
+    """Return a poster thumbnail from Wikipedia/Wikimedia without an API key."""
+    search_titles = get_wikipedia_search_titles(movie_title)
+    candidate_titles = [
+        f"{movie_title} (film)",
+        *search_titles,
+        str(movie_title),
+    ]
+
+    seen_titles = set()
+    for candidate_title in candidate_titles:
+        if candidate_title in seen_titles:
+            continue
+
+        seen_titles.add(candidate_title)
+        url = f"{WIKIPEDIA_SUMMARY_URL}/{quote(candidate_title, safe='')}"
+        try:
+            response = requests.get(
+                url,
+                headers=POSTER_REQUEST_HEADERS,
+                timeout=4,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            continue
+
+        if payload.get("type") == "disambiguation":
+            continue
+
+        thumbnail = payload.get("thumbnail", {})
+        poster_url = thumbnail.get("source")
+        if poster_url:
+            return poster_url
+
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_poster(movie_id, movie_title):
-    """Return a poster URL from TMDB, with an id lookup and title fallback."""
-    return fetch_poster_by_id(movie_id) or fetch_poster_by_title(movie_title)
+    """Return a poster URL using TPDb/configured, TMDB, then no-key fallbacks."""
+    return (
+        fetch_poster_from_tpdb(movie_id, movie_title)
+        or fetch_poster_by_id(movie_id)
+        or fetch_poster_by_title(movie_title)
+        or fetch_poster_from_wikipedia(movie_title)
+    )
 
 
 def recommend(movie_title, movies, similarity, count=5):
@@ -229,8 +370,8 @@ if st.button("Show Recommendations", type="primary"):
         poster_count = sum(1 for movie in recommended_movies if movie["poster"])
         if poster_count == 0:
             st.info(
-                "Recommendations are ready, but TMDB posters could not be loaded. "
-                "Please check your internet connection or TMDB API key."
+                "Recommendations are ready, but poster images could not be loaded. "
+                "Please check your internet connection or poster API settings."
             )
 
         columns = st.columns(len(recommended_movies))
@@ -238,7 +379,7 @@ if st.button("Show Recommendations", type="primary"):
         for column, movie in zip(columns, recommended_movies):
             with column:
                 if movie["poster"]:
-                    st.image(movie["poster"], use_container_width=True)
+                    st.image(movie["poster"], width="stretch")
                 else:
                     render_poster_placeholder(movie["title"])
 
